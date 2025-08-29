@@ -156,6 +156,68 @@ class PredictorCorrector(Generic[Diffusable]):
         batch = _sample_prior(self._multi_corruption, conditioning_data, mask=mask)
         return self._denoise(batch=batch, mask=mask, record=record)
 
+
+    @torch.no_grad()
+    def _denoise_one_step(
+        self,
+        batch: Diffusable,
+        mask: dict[str, torch.Tensor],
+        timestep_i: int,
+        record: bool = False,
+    ) -> SampleAndMeanAndMaybeRecords:
+        """Denoise from timestep_i to timestep_i+1 sample."""
+        recorded_samples = None
+        if record:
+            recorded_samples = []
+        for k in self._predictors:
+            mask.setdefault(k, None)
+        for k in self._correctors:
+            mask.setdefault(k, None)
+        mean_batch = batch.clone()
+
+        # Decreasing timesteps from T to eps_t
+        timesteps = torch.linspace(self._max_t, self._eps_t, self.N, device=self._device)
+        dt = -torch.tensor((self._max_t - self._eps_t) / (self.N - 1)).to(self._device)
+
+        # Set the timestep
+        t = torch.full((batch.get_batch_size(),), timesteps[timestep_i], device=self._device)
+
+        # Corrector updates.
+        if self._correctors:
+            for _ in range(self._n_steps_corrector):
+                score = self._score_fn(batch, t)
+                fns = {k: corrector.step_given_score for k, corrector in self._correctors.items()}
+                samples_means: dict[str, Tuple[torch.Tensor, torch.Tensor]] = apply(
+                    fns=fns,
+                    broadcast={"t": t, "dt": dt},
+                    x=batch,
+                    score=score,
+                    batch_idx=self._multi_corruption._get_batch_indices(batch),
+                )
+                if record:
+                    recorded_samples.append(batch.clone().to("cpu"))
+                batch, mean_batch = _mask_replace(
+                    samples_means=samples_means, batch=batch, mean_batch=mean_batch, mask=mask
+                )
+
+        # Predictor updates
+        score = self._score_fn(batch, t)
+        predictor_fns = {k: predictor.update_given_score for k, predictor in self._predictors.items()}
+        samples_means = apply(
+            fns=predictor_fns,
+            x=batch,
+            score=score,
+            broadcast=dict(t=t, batch=batch, dt=dt),
+            batch_idx=self._multi_corruption._get_batch_indices(batch),
+        )
+        if record:
+            recorded_samples.append(batch.clone().to("cpu"))
+        batch, mean_batch = _mask_replace(
+            samples_means=samples_means, batch=batch, mean_batch=mean_batch, mask=mask
+        )
+
+        return batch, mean_batch, recorded_samples
+
     @torch.no_grad()
     def _denoise(
         self,
