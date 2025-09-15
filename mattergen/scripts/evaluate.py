@@ -30,6 +30,7 @@ def main(
     reference_dataset_path: str | None = None,
     device: str = str(get_device()),
     structures_output_path: str | None = None,
+    save_sun_structures: str | None = None,
 ):
     structures = load_structures(Path(structures_path))
     energies = np.load(energies_path) if energies_path else None
@@ -52,6 +53,7 @@ def main(
         reference=reference,
         device=device,
         structures_output_path=structures_output_path,
+        save_sun_structures=save_sun_structures
     )
     print(json.dumps(metrics, indent=2))
 

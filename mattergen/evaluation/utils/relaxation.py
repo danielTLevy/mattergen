@@ -11,6 +11,7 @@ from pymatgen.core import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
 from mattergen.common.utils.globals import get_device
+from mattersim.datasets.utils.build import build_dataloader
 
 logger = get_logger()
 logger.level("ERROR")
@@ -45,3 +46,22 @@ def relax_structures(
     relaxed_atoms, total_energies = relax_atoms(atoms, device=device, potential_load_path=potential_load_path, output_path=output_path, **kwargs)
     relaxed_structures = [AseAtomsAdaptor.get_structure(a) for a in relaxed_atoms]
     return relaxed_structures, total_energies
+
+def get_total_energies(
+    structures: Structure | list[Structure],
+    device: str = str(get_device()),
+    potential_load_path: str = None,
+) -> np.ndarray:
+    if isinstance(structures, Structure):
+        structures = [structures]
+    atoms = [AseAtomsAdaptor.get_atoms(s) for s in structures]
+    potential = Potential.from_checkpoint(
+        device=device, load_path=potential_load_path, load_training_state=False
+    )
+    dataloader = build_dataloader(
+        atoms, batch_size=len(atoms), only_inference=True
+    )
+    energy_batch, forces_batch, stress_batch = potential.predict_properties(
+        dataloader, include_forces=True, include_stresses=True
+    )
+    return energy_batch

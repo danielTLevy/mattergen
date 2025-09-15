@@ -399,3 +399,7 @@ FodyWeavers.xsd
 
 # Virtual environment
 .venv/
+
+results/*
+datasets/cache/*
+outputs/*
