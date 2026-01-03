@@ -12,6 +12,21 @@ from mattergen.diffusion.sampling.predictors import AncestralSamplingPredictor
 
 SampleAndMean = tuple[torch.Tensor, torch.Tensor]
 
+def piecewise_quadratic(x, xb, a0, b1, b2):
+    # Left polynomial
+    yL = a0
+
+    # Right polynomial
+    yR = b1*(x-1000) + b2*(x - 1000)**2
+
+    return torch.where(x <= xb, yL, yR)
+
+def empirical_step_size(t):
+    "A function that roughly approximates the observed stepsize for base_model inference on MP-20"
+    timestep = 1000*(1 - t)  # scale to [0, 1000]
+    xb, a0, b1, b2 = torch.tensor([ 5.99400000e+02,  7.70723136e-02, -9.81254447e-05,  1.73344991e-07]).to(t.device)
+    return piecewise_quadratic(timestep, xb=xb, a0=a0, b1=b1, b2=b2)
+
 
 class LatticeAncestralSamplingPredictor(AncestralSamplingPredictor):
     @classmethod
@@ -89,6 +104,10 @@ class LatticeLangevinDiffCorrector(pc.LangevinCorrector):
         step_size = (snr * noise_norm / grad_norm) ** 2 * 2 * alpha
         step_size = torch.minimum(step_size, self.max_step_size)
         step_size[grad_norm == 0, :] = self.max_step_size
+        # Use empirical step size if specified
+        if self.use_empirical_stepsize:
+            step_size = empirical_step_size(t)
+
         step_size = maybe_expand(step_size, batch_idx, score)
         mean = x + step_size * score
         x = mean + torch.sqrt(step_size * 2) * noise

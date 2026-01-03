@@ -60,6 +60,7 @@ def main(
         os.makedirs(output_path)
 
     sampling_config_overrides = sampling_config_overrides or []
+    print("Using sampling config overrides:", sampling_config_overrides)
     config_overrides = config_overrides or []
     # Disable generating element types which are not supported or not in the desired chemical
     # system (if provided).

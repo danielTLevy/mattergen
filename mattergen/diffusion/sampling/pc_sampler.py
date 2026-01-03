@@ -13,6 +13,8 @@ from mattergen.diffusion.data.batched_data import BatchedData
 from mattergen.diffusion.diffusion_module import DiffusionModule
 from mattergen.diffusion.lightning_module import DiffusionLightningModule
 from mattergen.diffusion.sampling.pc_partials import CorrectorPartial, PredictorPartial
+from mattergen.common.utils.data_utils import compute_lattice_polar_decomposition
+
 
 Diffusable = TypeVar(
     "Diffusable", bound=BatchedData
@@ -262,6 +264,10 @@ class PredictorCorrector(Generic[Diffusable]):
                     batch, mean_batch = _mask_replace(
                         samples_means=samples_means, batch=batch, mean_batch=mean_batch, mask=mask
                     )
+            if self._n_steps_corrector == 0:
+                # This is normally done in the corrector step and is necessary
+                batch = batch.replace(cell=compute_lattice_polar_decomposition(batch.cell))
+                mean_batch = mean_batch.replace(cell=compute_lattice_polar_decomposition(mean_batch.cell))
 
             # Predictor updates
             score = self._score_fn(batch, t)

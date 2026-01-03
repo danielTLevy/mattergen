@@ -26,6 +26,31 @@ from mattergen.diffusion.wrapped.wrapped_sde import WrappedSDEMixin
 
 SampleAndMean = tuple[torch.Tensor, torch.Tensor]
 
+def softplus(z):
+    return torch.log1p(torch.exp(-torch.abs(z))) + torch.clamp(z, min=0.0)
+
+def model_log_step_size_2knee(
+    x, c, k1, x1, k2, x2,
+    bump_amp=0.0, bump_mu=0.0, bump_sigma=1.0
+):
+    """
+    y(x) = c - softplus(k1*(x-x1)) + softplus(k2*(x-x2)) + optional bump
+    """
+    y = c - softplus(k1 * (x - x1)) + softplus(k2 * (x - x2))
+
+    if bump_amp != 0.0:
+        y = y + bump_amp * torch.exp(
+            -0.5 * ((x - bump_mu) / bump_sigma) ** 2
+        )
+
+    return torch.exp(y)
+
+
+def empirical_step_size(t):
+    "A function that roughly approximates the observed stepsize for base_model inference on MP-20"
+    timestep = 1000*(1 - t)  # scale to [0, 1000]
+    p_opt = torch.tensor([3.65566571e+00, 6.53975257e-02, 2.46792010e+02, 5.38615792e-02, 3.73406277e+02, 6.83580477e+00, 1.66335738e+02, 1.84996667e+02])
+    return model_log_step_size_2knee(timestep, *p_opt)
 
 class Sampler(abc.ABC):
     def __init__(self, corruption: Corruption, score_fn: ScoreFunction | None):
@@ -49,6 +74,7 @@ class LangevinCorrector(Sampler):
         n_steps: int,
         snr: float = 0.2,
         max_step_size: float = 1.0,
+        use_empirical_stepsize = False
     ):
         """The Langevin corrector.
 
@@ -63,6 +89,7 @@ class LangevinCorrector(Sampler):
         self.n_steps = n_steps
         self.snr = snr
         self.max_step_size = torch.tensor(max_step_size)
+        self.use_empirical_stepsize = use_empirical_stepsize
 
     @classmethod
     def is_compatible(cls, corruption: Corruption):
@@ -113,6 +140,10 @@ class LangevinCorrector(Sampler):
         step_size = (snr * noise_norm / grad_norm) ** 2 * 2 * alpha
         step_size = torch.minimum(step_size, self.max_step_size)
         step_size[grad_norm == 0, :] = self.max_step_size
+
+        # Use empirical step size if specified
+        if self.use_empirical_stepsize:
+            step_size = empirical_step_size(t)
 
         # Expand step size to batch structure (score and noise have the same shape).
         step_size = maybe_expand(step_size, batch_idx, score)
