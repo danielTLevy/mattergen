@@ -141,11 +141,11 @@ class GuidedPredictorCorrector(PredictorCorrector):
           - proposal: the *guided* (CFG) predictor kernel
           - target: the *unconditional* predictor kernel
 
-        We currently compute **Gaussian log-probs for continuous predictor updates only**
-        (ancestral sampling predictors). If `predictor_logp_only=True`, corrector steps
-        are run as usual (for sample quality) but **are not included** in the log-prob,
-        because the default Langevin corrector chooses its step size using the sampled
-        noise norm, which makes the induced transition non-Gaussian in closed form.
+        We compute **Gaussian log-probs for continuous ancestral predictor updates**.
+        If `predictor_logp_only=False`, we also include Gaussian log-probs for
+        Langevin corrector steps **only when `use_empirical_stepsize=True`**, because
+        the default Langevin corrector chooses step size using the sampled noise norm,
+        which makes the induced transition non-Gaussian in closed form.
 
         Returns:
             (batch, mean_batch, recorded_samples, info)
@@ -159,8 +159,17 @@ class GuidedPredictorCorrector(PredictorCorrector):
         from torch_scatter import scatter_add
 
         from mattergen.diffusion.sampling.predictors import AncestralSamplingPredictor
+        from mattergen.diffusion.sampling.predictors_correctors import (
+            LangevinCorrector,
+            empirical_step_size as base_empirical_step_size,
+        )
         from mattergen.diffusion.corruption.multi_corruption import apply as multi_apply
+        from mattergen.diffusion.corruption.corruption import maybe_expand
         from mattergen.diffusion.sampling.pc_sampler import _mask_replace
+        from mattergen.common.diffusion.predictors_correctors import (
+            LatticeLangevinDiffCorrector,
+            empirical_step_size as lattice_empirical_step_size,
+        )
 
         if isinstance(self._diffusion_module, torch.nn.Module):
             self._diffusion_module.eval()
@@ -184,6 +193,21 @@ class GuidedPredictorCorrector(PredictorCorrector):
         # Set the timestep.
         t = torch.full((batch.get_batch_size(),), timesteps[timestep_i], device=self._device)
 
+        B = batch.get_batch_size()
+        logp_guided = torch.zeros((B,), device=self._device, dtype=torch.float32)
+        logp_uncond = torch.zeros((B,), device=self._device, dtype=torch.float32)
+        included_fields: list[str] = []
+
+        def gaussian_logp_per_row(sample: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+            # Returns logp per row (first dim), summing across remaining dims.
+            std = torch.clamp(std, min=eps)
+            diff = (sample - mean) / std
+            # Sum over all non-batch dims
+            reduce_dims = tuple(range(1, sample.ndim))
+            return -0.5 * (diff * diff).sum(dim=reduce_dims) - torch.log(std).sum(dim=reduce_dims) - 0.5 * math.log(
+                2.0 * math.pi
+            ) * (sample[0].numel() if sample.ndim > 1 else 1)
+
         # ---- Corrector updates (optional; NOT included in logp if predictor_logp_only) ----
         if self._correctors:
             if predictor_logp_only and self._n_steps_corrector > 0:
@@ -193,6 +217,14 @@ class GuidedPredictorCorrector(PredictorCorrector):
                     stacklevel=2,
                 )
             for _ in range(self._n_steps_corrector):
+                if not predictor_logp_only:
+                    for _, corrector in self._correctors.items():
+                        if isinstance(corrector, LangevinCorrector):
+                            assert corrector.use_empirical_stepsize, (
+                                "Corrector log-prob assumes a deterministic step_size. "
+                                "Set use_empirical_stepsize=True or use predictor_logp_only=True, "
+                                "because the default LangevinCorrector step_size depends on sampled noise norms."
+                            )
                 uncond_score, cond_score = self._score_pair(x=batch, t=t)
                 guided_score = uncond_score.replace(
                     **{
@@ -202,6 +234,9 @@ class GuidedPredictorCorrector(PredictorCorrector):
                         for k in self._multi_corruption.corrupted_fields
                     }
                 )
+                x_pre_corrector: dict[str, torch.Tensor] = {
+                    k: batch[k].clone() for k in self._correctors
+                }
                 fns = {k: corrector.step_given_score for k, corrector in self._correctors.items()}
                 samples_means = multi_apply(
                     fns=fns,
@@ -215,6 +250,39 @@ class GuidedPredictorCorrector(PredictorCorrector):
                 batch, mean_batch = _mask_replace(
                     samples_means=samples_means, batch=batch, mean_batch=mean_batch, mask=mask
                 )
+                if not predictor_logp_only:
+                    batch_indices = self._multi_corruption._get_batch_indices(batch)
+                    for field_name, corrector in self._correctors.items():
+                        if not isinstance(corrector, LangevinCorrector):
+                            continue
+                        if field_name not in batch_indices:
+                            continue
+                        if batch_indices[field_name] is None:
+                            continue
+                        if mask.get(field_name) is not None:
+                            continue
+
+                        if isinstance(corrector, LatticeLangevinDiffCorrector):
+                            step_size = lattice_empirical_step_size(t)
+                        else:
+                            step_size = base_empirical_step_size(t)
+                        step_size = maybe_expand(step_size, batch_indices[field_name], guided_score[field_name])
+                        std = torch.sqrt(torch.clamp(step_size * 2, min=eps))
+
+                        mean_g = x_pre_corrector[field_name] + step_size * guided_score[field_name]
+                        mean_u = x_pre_corrector[field_name] + step_size * uncond_score[field_name]
+                        sample = batch[field_name]
+
+                        lp_g_rows = gaussian_logp_per_row(sample, mean_g, std)
+                        lp_u_rows = gaussian_logp_per_row(sample, mean_u, std)
+                        bidx = batch_indices[field_name]
+                        logp_guided = logp_guided + scatter_add(
+                            lp_g_rows, index=bidx, dim=0, dim_size=B
+                        )
+                        logp_uncond = logp_uncond + scatter_add(
+                            lp_u_rows, index=bidx, dim=0, dim_size=B
+                        )
+                        included_fields.append(f"{field_name}:corrector")
 
         # ---- Predictor update (included in logp) ----
         uncond_score, cond_score = self._score_pair(x=batch, t=t)
@@ -253,26 +321,14 @@ class GuidedPredictorCorrector(PredictorCorrector):
         )
 
         batch_indices = self._multi_corruption._get_batch_indices(batch)
-        B = batch.get_batch_size()
-        logp_guided = torch.zeros((B,), device=self._device, dtype=torch.float32)
-        logp_uncond = torch.zeros((B,), device=self._device, dtype=torch.float32)
-        included_fields: list[str] = []
-
-        def gaussian_logp_per_row(sample: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-            # Returns logp per row (first dim), summing across remaining dims.
-            std = torch.clamp(std, min=eps)
-            diff = (sample - mean) / std
-            # Sum over all non-batch dims
-            reduce_dims = tuple(range(1, sample.ndim))
-            return -0.5 * (diff * diff).sum(dim=reduce_dims) - torch.log(std).sum(dim=reduce_dims) - 0.5 * math.log(
-                2.0 * math.pi
-            ) * (sample[0].numel() if sample.ndim > 1 else 1)
-
         for field_name, predictor in self._predictors.items():
             # Only continuous ancestral predictors have a well-defined Gaussian kernel here.
             if not isinstance(predictor, AncestralSamplingPredictor):
                 continue
             if field_name not in batch_indices:
+                continue
+            if batch_indices[field_name] is None:
+                # Some fields may not have batch indices (e.g., not present in this batch).
                 continue
             if mask.get(field_name) is not None:
                 # Inpainting masks produce partially deterministic transitions; skip for now.

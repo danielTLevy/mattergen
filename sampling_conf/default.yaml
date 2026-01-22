@@ -27,13 +27,13 @@ sampler_partial:
       _partial_: true
       max_step_size: 1e6
       snr: 0.4
-      use_empirical_stepsize: false
+      use_empirical_stepsize: true
     cell:
       _target_: mattergen.common.diffusion.predictors_correctors.LatticeLangevinDiffCorrector
       _partial_: true
       max_step_size: 1e6
       snr: 0.2
-      use_empirical_stepsize: false
+      use_empirical_stepsize: true
 
   n_steps_corrector: 1
 
