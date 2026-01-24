@@ -62,6 +62,6 @@ def get_total_energies(
         atoms, batch_size=len(atoms), only_inference=True
     )
     energy_batch, forces_batch, stress_batch = potential.predict_properties(
-        dataloader, include_forces=True, include_stresses=True
+        dataloader, include_forces=False, include_stresses=False
     )
     return energy_batch
