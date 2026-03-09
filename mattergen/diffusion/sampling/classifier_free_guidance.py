@@ -132,7 +132,7 @@ class GuidedPredictorCorrector(PredictorCorrector):
         timestep_i: int,
         *,
         record: bool = False,
-        predictor_logp_only: bool = True,
+        predictor_logp_only: bool = False,
         eps: float = 1e-12,
     ) -> tuple[Diffusable, Diffusable, list[Diffusable] | None, dict[str, torch.Tensor]]:
         """
@@ -355,7 +355,8 @@ class GuidedPredictorCorrector(PredictorCorrector):
             logp_guided = logp_guided + scatter_add(lp_g_rows, index=bidx, dim=0, dim_size=B)
             logp_uncond = logp_uncond + scatter_add(lp_u_rows, index=bidx, dim=0, dim_size=B)
             included_fields.append(field_name)
-
+        if timestep_i >= 999:
+            logp_uncond = logp_guided
         info: dict[str, torch.Tensor] = {
             "logp_guided": logp_guided,
             "logp_uncond": logp_uncond,
