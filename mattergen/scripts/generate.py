@@ -29,6 +29,7 @@ def main(
     diffusion_guidance_factor: float | None = None,
     strict_checkpoint_loading: bool = True,
     target_compositions: list[dict[str, int]] | None = None,
+    seed: int | None = None
 ) -> list[Structure]:
     """
     Evaluate diffusion model against molecular metrics.
@@ -49,6 +50,15 @@ def main(
 
     NOTE: When specifying dictionary values via the CLI, make sure there is no whitespace between the key and value, e.g., `--properties_to_condition_on={key1:value1}`.
     """
+    if seed is not None:
+        print(f"Setting random seed to {seed} for reproducibility.")
+        import numpy as np
+        import torch
+        import random
+
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        random.seed(seed)
     assert (
         pretrained_name is not None or model_path is not None
     ), "Either pretrained_name or model_path must be provided."

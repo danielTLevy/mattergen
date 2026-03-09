@@ -64,10 +64,14 @@ class MetricsStructureSummary:
         if self.original_structure is None:
             return np.nan  # Return nan since it cannot compute rmsd
         else:
-            return compute_rmsd_angstrom(
-                self.entry.structure,
-                preprocess_structure(self.original_structure),
-            )
+            try: 
+                preprocessed_structure = preprocess_structure(self.original_structure)
+                return compute_rmsd_angstrom(
+                    self.entry.structure,
+                    preprocessed_structure)
+            except Exception as e:
+                warnings.warn(f"Preprocessing original structure failed: {e}")
+                return np.nan
 
     @property
     def structure(self) -> Structure:

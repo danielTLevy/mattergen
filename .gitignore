@@ -403,3 +403,8 @@ FodyWeavers.xsd
 results/*
 datasets/cache/*
 outputs/*
+
+build/*
+mattergen.egg-info/*
+checkpoints/*
+*.out
