@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import json
 import os
 from pymatgen.core.structure import Structure
 
@@ -73,11 +74,16 @@ def evaluate(
     
     if save_sun_structures:
         print("Saving SUN structures to", save_sun_structures)
-        sun_structures = evaluator.filter(structures, evaluator.is_unique & evaluator.is_stable & evaluator.is_novel)
+        sun_mask = evaluator.is_unique & evaluator.is_stable & evaluator.is_novel
+        sun_structures = evaluator.filter(structures, sun_mask)
         sun_structures = [s for s in sun_structures if s is not None]
         if len(sun_structures) > 0:
             if not os.path.exists(save_sun_structures):
                 os.makedirs(save_sun_structures)
+            original_indices = [i for i, m in enumerate(sun_mask) if m]
+            index_mapping = {orig: sun for sun, orig in enumerate(original_indices)}
+            with open(os.path.join(save_sun_structures, "sun_index_mapping.json"), "w") as f:
+                json.dump(index_mapping, f)
             for i, s in enumerate(sun_structures):
                 s.to(filename=os.path.join(save_sun_structures, f"sun_structure_{i}.cif"))
     return compute_metrics_out
