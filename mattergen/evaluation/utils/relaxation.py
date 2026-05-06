@@ -59,7 +59,7 @@ def get_total_energies(
         device=device, load_path=potential_load_path, load_training_state=False
     )
     dataloader = build_dataloader(
-        atoms, batch_size=len(atoms), only_inference=True
+        atoms, batch_size=256, only_inference=True
     )
     energy_batch, forces_batch, stress_batch = potential.predict_properties(
         dataloader, include_forces=False, include_stresses=False

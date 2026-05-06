@@ -61,7 +61,10 @@ class BaseDataset(Dataset):
                 continue
             val = self.properties[prop][index]
             if prop == "space_group":
-                val = space_group_number_for_symbol(val)
+                if isinstance(val, str):
+                    val = space_group_number_for_symbol(val)
+                else:
+                    val = int(val)
             props_dict[prop] = (
                 torch.from_numpy(val) if isinstance(val, np.ndarray) else torch.tensor(val)
             )
