@@ -77,11 +77,23 @@ def evaluate(
         sun_mask = evaluator.is_unique & evaluator.is_stable & evaluator.is_novel
         sun_structures = evaluator.filter(structures, sun_mask)
         sun_structures = [s for s in sun_structures if s is not None]
+        if not os.path.exists(save_sun_structures):
+            os.makedirs(save_sun_structures)
+        original_indices = [i for i, m in enumerate(sun_mask) if m]
+        index_mapping = {orig: sun for sun, orig in enumerate(original_indices)}
+        structure_sun_info = {
+            i: {
+                "energy": float(energies[i]),
+                "is_stable": bool(evaluator.is_stable[i]),
+                "is_unique": bool(evaluator.is_unique[i]),
+                "is_novel": bool(evaluator.is_novel[i]),
+                "sun_index": index_mapping.get(i),
+            }
+            for i in range(len(structures))
+        }
+        with open(os.path.join(save_sun_structures, "structure_sun_info.json"), "w") as f:
+            json.dump(structure_sun_info, f, indent=2)
         if len(sun_structures) > 0:
-            if not os.path.exists(save_sun_structures):
-                os.makedirs(save_sun_structures)
-            original_indices = [i for i, m in enumerate(sun_mask) if m]
-            index_mapping = {orig: sun for sun, orig in enumerate(original_indices)}
             with open(os.path.join(save_sun_structures, "sun_index_mapping.json"), "w") as f:
                 json.dump(index_mapping, f)
             for i, s in enumerate(sun_structures):
