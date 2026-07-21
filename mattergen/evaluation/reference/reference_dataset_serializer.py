@@ -147,11 +147,11 @@ class LMDBBackedReferenceDatasetImpl(ReferenceDatasetImpl):
     def _build_num_entries_by_chemsys_reduced_formulas(
         self, lmdb_path: Path
     ) -> dict[str, dict[str, int]]:
-        chemical_systems = lmdb_read_metadata(lmdb_path, "chemical_systems")
         result: defaultdict[str, dict[str, int]] = defaultdict(dict)
         with self.env.begin() as txn:
+            chemical_systems = lmdb_get(txn, "chemical_systems")
             for chemsys in chemical_systems:
-                reduced_formulas = lmdb_read_metadata(lmdb_path, f"{chemsys}.reduced_formulas")
+                reduced_formulas = lmdb_get(txn, f"{chemsys}.reduced_formulas")
                 for reduced_formula in reduced_formulas:
                     result[chemsys][reduced_formula] = lmdb_get(
                         txn, f"{chemsys}.{reduced_formula}.length"
