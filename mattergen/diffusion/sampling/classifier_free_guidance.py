@@ -213,6 +213,10 @@ class GuidedPredictorCorrector(PredictorCorrector):
             LatticeLangevinDiffCorrector,
             empirical_step_size as lattice_empirical_step_size,
         )
+        from mattergen.diffusion.d3pm.d3pm_predictors_correctors import (
+            D3PMAncestralSamplingPredictor,
+        )
+        from mattergen.diffusion.discrete_time import to_discrete_time
         # Imported here (not at module top) to avoid a circular import: `mattergen.common`
         # depends on `mattergen.diffusion`, so this lower-level module must import lattice
         # symbols lazily. Used to explicitly exclude the lattice (`cell`) field from the
@@ -369,55 +373,116 @@ class GuidedPredictorCorrector(PredictorCorrector):
 
         batch_indices = self._multi_corruption._get_batch_indices(batch)
         for field_name, predictor in self._predictors.items():
-            # Only continuous ancestral predictors have a well-defined Gaussian kernel here.
-            if not isinstance(predictor, AncestralSamplingPredictor):
-                continue
-            if isinstance(predictor.corruption, LatticeVPSDE):
-                # `cell` (lattice) is a LatticeAncestralSamplingPredictor -- it subclasses
-                # AncestralSamplingPredictor and so PASSES the isinstance check above, but it
-                # does NOT have a plain isotropic-Gaussian kernel: its update draws symmetrized
-                # noise `make_noise_symmetric_preserve_variance` (off-diagonal entries are
-                # duplicated -> degenerate rank-6 covariance; a naive per-component sum would
-                # double-count every off-diagonal pair) and its corrector applies a nonlinear
-                # `compute_lattice_polar_decomposition`. There is no closed-form isotropic
-                # importance ratio, so exclude it explicitly here rather than relying on the
-                # incidental `batch_indices[field_name] is None` skip below (which would
-                # silently start contributing a WRONG isotropic term if `cell` were ever given
-                # a per-graph batch index). The cell contribution to the importance weight is
-                # therefore omitted (partial correction), like the discrete `atomic_numbers`.
-                continue
-            if field_name not in batch_indices:
-                continue
-            if batch_indices[field_name] is None:
-                # Some fields may not have batch indices (e.g., not present in this batch).
-                continue
-            if mask.get(field_name) is not None:
-                # Inpainting masks produce partially deterministic transitions; skip for now.
-                continue
+            # Only continuous ancestral (Gaussian) and D3PM (categorical) predictors have a
+            # well-defined closed-form kernel here.
+            if isinstance(predictor, AncestralSamplingPredictor):
+                if isinstance(predictor.corruption, LatticeVPSDE):
+                    # `cell` (lattice) is a LatticeAncestralSamplingPredictor -- it subclasses
+                    # AncestralSamplingPredictor and so PASSES the isinstance check above, but it
+                    # does NOT have a plain isotropic-Gaussian kernel: its update draws symmetrized
+                    # noise `make_noise_symmetric_preserve_variance` (off-diagonal entries are
+                    # duplicated -> degenerate rank-6 covariance; a naive per-component sum would
+                    # double-count every off-diagonal pair) and its corrector applies a nonlinear
+                    # `compute_lattice_polar_decomposition`. There is no closed-form isotropic
+                    # importance ratio, so exclude it explicitly here rather than relying on the
+                    # incidental `batch_indices[field_name] is None` skip below (which would
+                    # silently start contributing a WRONG isotropic term if `cell` were ever given
+                    # a per-graph batch index). The cell contribution to the importance weight is
+                    # therefore omitted (partial correction), like the discrete `atomic_numbers`.
+                    continue
+                if field_name not in batch_indices:
+                    continue
+                if batch_indices[field_name] is None:
+                    # Some fields may not have batch indices (e.g., not present in this batch).
+                    continue
+                if mask.get(field_name) is not None:
+                    # Inpainting masks produce partially deterministic transitions; skip for now.
+                    continue
 
-            # Coefficients are deterministic given (x_pre, t, dt, batch_idx, batch).
-            x_coeff, score_coeff, std = predictor._get_coeffs(  # pylint: disable=protected-access
-                x=x_pre[field_name],
-                t=t,
-                dt=dt,
-                batch_idx=batch_indices[field_name],
-                batch=batch,
-            )
+                # Coefficients are deterministic given (x_pre, t, dt, batch_idx, batch).
+                x_coeff, score_coeff, std = predictor._get_coeffs(  # pylint: disable=protected-access
+                    x=x_pre[field_name],
+                    t=t,
+                    dt=dt,
+                    batch_idx=batch_indices[field_name],
+                    batch=batch,
+                )
 
-            sample = batch[field_name]
-            mean_g = x_coeff * x_pre[field_name] + score_coeff * guided_score[field_name]
-            mean_u = x_coeff * x_pre[field_name] + score_coeff * uncond_score[field_name]
+                sample = batch[field_name]
+                mean_g = x_coeff * x_pre[field_name] + score_coeff * guided_score[field_name]
+                mean_u = x_coeff * x_pre[field_name] + score_coeff * uncond_score[field_name]
 
-            _corruption = predictor.corruption
-            _boundary = _corruption.wrapping_boundary if isinstance(_corruption, WrappedSDEMixin) else None
-            lp_g_rows = _gaussian_logp_per_row(sample, mean_g, std, boundary=_boundary)
-            lp_u_rows = _gaussian_logp_per_row(sample, mean_u, std, boundary=_boundary)
+                _corruption = predictor.corruption
+                _boundary = _corruption.wrapping_boundary if isinstance(_corruption, WrappedSDEMixin) else None
+                lp_g_rows = _gaussian_logp_per_row(sample, mean_g, std, boundary=_boundary)
+                lp_u_rows = _gaussian_logp_per_row(sample, mean_u, std, boundary=_boundary)
 
-            # Aggregate row-level logp to per-sample logp via batch_idx.
-            bidx = batch_indices[field_name]
-            logp_guided = logp_guided + scatter_add(lp_g_rows, index=bidx, dim=0, dim_size=B)
-            logp_uncond = logp_uncond + scatter_add(lp_u_rows, index=bidx, dim=0, dim_size=B)
-            included_fields.append(field_name)
+                # Aggregate row-level logp to per-sample logp via batch_idx.
+                bidx = batch_indices[field_name]
+                logp_guided = logp_guided + scatter_add(lp_g_rows, index=bidx, dim=0, dim_size=B)
+                logp_uncond = logp_uncond + scatter_add(lp_u_rows, index=bidx, dim=0, dim_size=B)
+                included_fields.append(field_name)
+            elif isinstance(predictor, D3PMAncestralSamplingPredictor):
+                if field_name not in batch_indices:
+                    continue
+                if batch_indices[field_name] is None:
+                    # Some fields may not have batch indices (e.g., not present in this batch).
+                    continue
+                if mask.get(field_name) is not None:
+                    # Inpainting masks produce partially deterministic transitions; skip for now.
+                    continue
+
+                corruption = predictor.corruption  # D3PMCorruption instance
+                bidx = batch_indices[field_name]
+
+                # Discrete time index, per-atom via bidx -- mirrors
+                # d3pm_predictors_correctors.py:65 (`t = to_discrete_time(...)`) and :88
+                # (`t[batch_idx].to(torch.long)`).
+                t_discrete = to_discrete_time(t=t, N=predictor.N, T=corruption.T)
+                t_per_atom = t_discrete[bidx].to(torch.long)
+
+                # Pre-update x_t, zero-based -- mirrors d3pm_predictors_correctors.py:90-92
+                # (`self.corruption._to_zero_based(x)`, where `x` there is the pre-update state).
+                x_pre_zero_based = corruption._to_zero_based(x_pre[field_name])
+
+                def _posterior_logits(raw_logits: torch.Tensor) -> torch.Tensor:
+                    class_probs = torch.softmax(raw_logits, dim=-1)
+                    if predictor.predict_x0:
+                        # Mirrors d3pm_predictors_correctors.py:86-94.
+                        logits, _ = corruption.d3pm.sample_and_compute_posterior_q(
+                            x_0=class_probs,
+                            t=t_per_atom,
+                            make_one_hot=False,
+                            samples=x_pre_zero_based,
+                            return_logits=True,
+                        )
+                        return logits
+                    # predict_x0=False: the sampled-from distribution is the raw logits
+                    # themselves (d3pm_predictors_correctors.py:67-74). Not exercised by any
+                    # current config (sampling_conf/default.yaml always sets predict_x0=True);
+                    # kept for API symmetry only, untested.
+                    return raw_logits
+
+                # Post-update x_{t-1}, zero-based -- mirrors the `x_sample` realized by
+                # `update_given_score` (d3pm_predictors_correctors.py:96-98), converted back to
+                # zero-based for `Categorical.log_prob`.
+                realized_zero_based = corruption._to_zero_based(batch[field_name]).long()
+
+                logits_g = _posterior_logits(guided_score[field_name])
+                logits_u = _posterior_logits(uncond_score[field_name])
+
+                lp_g_rows = torch.distributions.Categorical(logits=logits_g).log_prob(
+                    realized_zero_based
+                )
+                lp_u_rows = torch.distributions.Categorical(logits=logits_u).log_prob(
+                    realized_zero_based
+                )
+
+                logp_guided = logp_guided + scatter_add(lp_g_rows, index=bidx, dim=0, dim_size=B)
+                logp_uncond = logp_uncond + scatter_add(lp_u_rows, index=bidx, dim=0, dim_size=B)
+                included_fields.append(field_name)
+            else:
+                continue
         if timestep_i >= 999:
             logp_uncond = logp_guided
         info: dict[str, torch.Tensor] = {
