@@ -213,6 +213,11 @@ class GuidedPredictorCorrector(PredictorCorrector):
             LatticeLangevinDiffCorrector,
             empirical_step_size as lattice_empirical_step_size,
         )
+        # Imported here (not at module top) to avoid a circular import: `mattergen.common`
+        # depends on `mattergen.diffusion`, so this lower-level module must import lattice
+        # symbols lazily. Used to explicitly exclude the lattice (`cell`) field from the
+        # Gaussian importance ratio (see the skip guards below).
+        from mattergen.common.diffusion.corruption import LatticeVPSDE
 
         if isinstance(self._diffusion_module, torch.nn.Module):
             self._diffusion_module.eval()
@@ -288,6 +293,13 @@ class GuidedPredictorCorrector(PredictorCorrector):
                     for field_name, corrector in self._correctors.items():
                         if not isinstance(corrector, LangevinCorrector):
                             continue
+                        if isinstance(corrector.corruption, LatticeVPSDE):
+                            # `cell` (lattice) has no closed-form isotropic-Gaussian
+                            # importance ratio: its noise is symmetrized (degenerate,
+                            # rank-6 covariance) and this corrector applies a nonlinear
+                            # polar decomposition. Exclude it explicitly (see predictor
+                            # loop for the full rationale).
+                            continue
                         if field_name not in batch_indices:
                             continue
                         if batch_indices[field_name] is None:
@@ -359,6 +371,20 @@ class GuidedPredictorCorrector(PredictorCorrector):
         for field_name, predictor in self._predictors.items():
             # Only continuous ancestral predictors have a well-defined Gaussian kernel here.
             if not isinstance(predictor, AncestralSamplingPredictor):
+                continue
+            if isinstance(predictor.corruption, LatticeVPSDE):
+                # `cell` (lattice) is a LatticeAncestralSamplingPredictor -- it subclasses
+                # AncestralSamplingPredictor and so PASSES the isinstance check above, but it
+                # does NOT have a plain isotropic-Gaussian kernel: its update draws symmetrized
+                # noise `make_noise_symmetric_preserve_variance` (off-diagonal entries are
+                # duplicated -> degenerate rank-6 covariance; a naive per-component sum would
+                # double-count every off-diagonal pair) and its corrector applies a nonlinear
+                # `compute_lattice_polar_decomposition`. There is no closed-form isotropic
+                # importance ratio, so exclude it explicitly here rather than relying on the
+                # incidental `batch_indices[field_name] is None` skip below (which would
+                # silently start contributing a WRONG isotropic term if `cell` were ever given
+                # a per-graph batch index). The cell contribution to the importance weight is
+                # therefore omitted (partial correction), like the discrete `atomic_numbers`.
                 continue
             if field_name not in batch_indices:
                 continue
