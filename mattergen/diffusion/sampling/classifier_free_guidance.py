@@ -1,12 +1,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import math
 from typing import Callable
 
 import torch
 
 from mattergen.diffusion.sampling.pc_sampler import Diffusable, PredictorCorrector
 from mattergen.common.data.collate import collate
+from mattergen.diffusion.wrapped.wrapped_sde import WrappedSDEMixin
 
 BatchTransform = Callable[[Diffusable], Diffusable]
 
@@ -16,6 +18,48 @@ def identity(x: Diffusable) -> Diffusable:
     Default function that transforms data to its conditional state
     """
     return x
+
+
+def _gaussian_logp_per_row(
+    sample: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    boundary: float | None = None,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Per-row Gaussian log-density, summing over all non-batch (row>0) dims.
+
+    Args:
+        sample: realized value, shape [num_rows, ...].
+        mean: predicted mean, same shape as sample.
+        std: standard deviation, broadcastable to sample.
+        boundary: if not None, the field lives on a torus of this period
+            (wrapped coordinates). The displacement (sample - mean) is reduced
+            to its minimum image in [-boundary/2, boundary/2) before forming the
+            Gaussian. REQUIRED for wrapped fields whose stored `sample` is
+            wrapped into [0, boundary) while `mean` is the raw (unwrapped)
+            predictor mean; without it a boundary crossing injects a spurious
+            +boundary*delta/std**2 bias into the importance log-ratio. Exact as
+            std -> 0 (where the bug is worst); a minimum-image approximation to
+            the full periodic image sum at high noise.
+        eps: floor on std for numerical stability.
+
+    Returns:
+        Tensor of shape [num_rows]: the per-row log-density (normalization
+        constant included but it cancels in guided/uncond log-ratios).
+    """
+    std = torch.clamp(std, min=eps)
+    diff = sample - mean
+    if boundary is not None:
+        diff = diff - boundary * torch.round(diff / boundary)
+    diff = diff / std
+    reduce_dims = tuple(range(1, sample.ndim))
+    n = sample[0].numel() if sample.ndim > 1 else 1
+    return (
+        -0.5 * (diff * diff).sum(dim=reduce_dims)
+        - torch.log(std).sum(dim=reduce_dims)
+        - 0.5 * math.log(2.0 * math.pi) * n
+    )
 
 
 class GuidedPredictorCorrector(PredictorCorrector):
@@ -154,7 +198,6 @@ class GuidedPredictorCorrector(PredictorCorrector):
             - "logp_uncond": shape [B]
             - "logp_num_fields": number of fields included in logp
         """
-        import math
         import warnings
         from torch_scatter import scatter_add
 
@@ -197,16 +240,6 @@ class GuidedPredictorCorrector(PredictorCorrector):
         logp_guided = torch.zeros((B,), device=self._device, dtype=torch.float32)
         logp_uncond = torch.zeros((B,), device=self._device, dtype=torch.float32)
         included_fields: list[str] = []
-
-        def gaussian_logp_per_row(sample: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-            # Returns logp per row (first dim), summing across remaining dims.
-            std = torch.clamp(std, min=eps)
-            diff = (sample - mean) / std
-            # Sum over all non-batch dims
-            reduce_dims = tuple(range(1, sample.ndim))
-            return -0.5 * (diff * diff).sum(dim=reduce_dims) - torch.log(std).sum(dim=reduce_dims) - 0.5 * math.log(
-                2.0 * math.pi
-            ) * (sample[0].numel() if sample.ndim > 1 else 1)
 
         # ---- Corrector updates (optional; NOT included in logp if predictor_logp_only) ----
         if self._correctors:
@@ -273,8 +306,10 @@ class GuidedPredictorCorrector(PredictorCorrector):
                         mean_u = x_pre_corrector[field_name] + step_size * uncond_score[field_name]
                         sample = batch[field_name]
 
-                        lp_g_rows = gaussian_logp_per_row(sample, mean_g, std)
-                        lp_u_rows = gaussian_logp_per_row(sample, mean_u, std)
+                        _corruption = corrector.corruption
+                        _boundary = _corruption.wrapping_boundary if isinstance(_corruption, WrappedSDEMixin) else None
+                        lp_g_rows = _gaussian_logp_per_row(sample, mean_g, std, boundary=_boundary)
+                        lp_u_rows = _gaussian_logp_per_row(sample, mean_u, std, boundary=_boundary)
                         bidx = batch_indices[field_name]
                         logp_guided = logp_guided + scatter_add(
                             lp_g_rows, index=bidx, dim=0, dim_size=B
@@ -347,8 +382,10 @@ class GuidedPredictorCorrector(PredictorCorrector):
             mean_g = x_coeff * x_pre[field_name] + score_coeff * guided_score[field_name]
             mean_u = x_coeff * x_pre[field_name] + score_coeff * uncond_score[field_name]
 
-            lp_g_rows = gaussian_logp_per_row(sample, mean_g, std)
-            lp_u_rows = gaussian_logp_per_row(sample, mean_u, std)
+            _corruption = predictor.corruption
+            _boundary = _corruption.wrapping_boundary if isinstance(_corruption, WrappedSDEMixin) else None
+            lp_g_rows = _gaussian_logp_per_row(sample, mean_g, std, boundary=_boundary)
+            lp_u_rows = _gaussian_logp_per_row(sample, mean_u, std, boundary=_boundary)
 
             # Aggregate row-level logp to per-sample logp via batch_idx.
             bidx = batch_indices[field_name]
