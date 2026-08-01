@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-"""Tests for the explicit lattice (`cell`) exclusion from the IS Gaussian ratio.
+"""Structural tests for the lattice (`cell`) IS Gaussian ratio.
 
 `cell` uses `LatticeAncestralSamplingPredictor`, which subclasses
 `AncestralSamplingPredictor` (so it PASSES the isinstance dispatch in
@@ -13,11 +13,9 @@ Gaussian kernel:
     every off-diagonal pair, and
   * its corrector applies a nonlinear `compute_lattice_polar_decomposition`.
 
-So there is no closed-form isotropic importance ratio and the field must be
-excluded. These tests pin the two facts the exclusion relies on: (1) the
-predicate `isinstance(corruption, LatticeVPSDE)` selects the lattice corruption
-and NOT the wrapped-coordinate corruption used for `pos`, and (2) the lattice
-noise really is symmetric (degenerate).
+The production ratio therefore uses six independent symmetric coordinates and
+scores the corrector's pre-polar latent. These tests pin the dispatch and noise
+structure that implementation relies on.
 """
 import torch
 
@@ -25,16 +23,15 @@ from mattergen.common.diffusion.corruption import LatticeVPSDE, make_noise_symme
 from mattergen.diffusion.wrapped.wrapped_sde import WrappedVESDE, WrappedSDEMixin
 
 
-def test_exclusion_predicate_selects_only_lattice():
+def test_lattice_predicate_selects_only_lattice():
     lattice = LatticeVPSDE()
     pos = WrappedVESDE()  # the fractional-coordinate corruption
 
-    # The guard keys on isinstance(corruption, LatticeVPSDE):
-    assert isinstance(lattice, LatticeVPSDE)          # cell -> excluded
-    assert not isinstance(pos, LatticeVPSDE)          # pos  -> NOT excluded (gets the wrap fix)
+    assert isinstance(lattice, LatticeVPSDE)
+    assert not isinstance(pos, LatticeVPSDE)
 
     # And the lattice field is NOT wrapped, so it must not receive the torus min-image
-    # treatment either -- it is a genuinely separate (excluded) case.
+    # treatment either -- it uses the symmetric six-coordinate density.
     assert not isinstance(lattice, WrappedSDEMixin)
     assert isinstance(pos, WrappedSDEMixin)
 

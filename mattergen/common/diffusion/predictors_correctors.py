@@ -85,6 +85,30 @@ class LatticeLangevinDiffCorrector(pc.LangevinCorrector):
         t: torch.Tensor,
         dt: torch.Tensor,
     ) -> SampleAndMean:
+        x, mean, _ = self.step_given_score_with_latent(
+            x=x,
+            batch_idx=batch_idx,
+            score=score,
+            t=t,
+            dt=dt,
+        )
+        return x, mean
+
+    def step_given_score_with_latent(
+        self,
+        *,
+        x: torch.Tensor,
+        batch_idx: torch.LongTensor | None,
+        score: torch.Tensor,
+        t: torch.Tensor,
+        dt: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run one lattice corrector step and retain the pre-polar Gaussian latent.
+
+        The latent is required to score the exact augmented transition density;
+        polar decomposition is nonlinear and can map multiple latents to the same
+        returned lattice.
+        """
         assert isinstance(self.corruption, sde_lib.LatticeVPSDE)
         alpha = self.get_alpha(t, dt=dt)
         snr = self.snr
@@ -110,8 +134,8 @@ class LatticeLangevinDiffCorrector(pc.LangevinCorrector):
 
         step_size = maybe_expand(step_size, batch_idx, score)
         mean = x + step_size * score
-        x = mean + torch.sqrt(step_size * 2) * noise
+        pre_polar_sample = mean + torch.sqrt(step_size * 2) * noise
 
-        x = compute_lattice_polar_decomposition(x)
+        x = compute_lattice_polar_decomposition(pre_polar_sample)
         mean = compute_lattice_polar_decomposition(mean)
-        return x, mean
+        return x, mean, pre_polar_sample
