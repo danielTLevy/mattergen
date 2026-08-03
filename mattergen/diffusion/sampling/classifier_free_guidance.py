@@ -224,6 +224,7 @@ class GuidedPredictorCorrector(PredictorCorrector):
         record: bool = False,
         predictor_logp_only: bool = False,
         include_lattice_logp: bool = False,
+        record_per_field: bool = False,
         eps: float = 1e-12,
     ) -> tuple[Diffusable, Diffusable, list[Diffusable] | None, dict[str, torch.Tensor]]:
         """
@@ -235,6 +236,15 @@ class GuidedPredictorCorrector(PredictorCorrector):
         We compute Gaussian log-probs for continuous ancestral predictor updates.
         When ``include_lattice_logp`` is true, this includes the six independent
         symmetric lattice coordinates; it is false by default for compatibility.
+        When ``record_per_field`` is true, ``info["_per_field_logp_guided"]`` and
+        ``info["_per_field_logp_uncond"]`` break the two scalar totals down by
+        component (``pos``, ``pos:corrector``, ``cell``, ``cell:corrector``,
+        ``atomic_numbers``), each a per-sample ``[B]`` tensor summing exactly to
+        the corresponding total. This is what makes it possible to attribute the
+        importance ratio to the Langevin corrector vs the ancestral predictor,
+        which cannot be recovered from a saved run (only the two summed scalars
+        are persisted per edge) and cannot be obtained by differencing two runs
+        (sampling is not reproducible run-to-run).
         If `predictor_logp_only=False`, we also include Gaussian log-probs for
         Langevin corrector steps **only when `use_empirical_stepsize=True`**, because
         the default Langevin corrector chooses step size using the sampled noise norm,
@@ -310,6 +320,32 @@ class GuidedPredictorCorrector(PredictorCorrector):
                 name, torch.zeros_like(guided)
             ) + guided
             lattice_logp_uncond[name] = lattice_logp_uncond.get(
+                name, torch.zeros_like(unconditional)
+            ) + unconditional
+
+        # Per-component breakdown of the two scalar totals. Only populated when
+        # ``record_per_field``; the components sum exactly to ``logp_guided`` /
+        # ``logp_uncond`` because every call site below sits inside the same
+        # branch that accumulates into those totals.
+        per_field_logp_guided: dict[str, torch.Tensor] = {}
+        per_field_logp_uncond: dict[str, torch.Tensor] = {}
+
+        def _record_per_field(
+            name: str,
+            guided: torch.Tensor,
+            unconditional: torch.Tensor,
+        ) -> None:
+            """Accumulate a per-sample [B] logp contribution under ``name``.
+
+            Accumulates rather than assigns: with ``n_steps_corrector > 1`` a
+            corrector component is scored once per corrector step.
+            """
+            if not record_per_field:
+                return
+            per_field_logp_guided[name] = per_field_logp_guided.get(
+                name, torch.zeros_like(guided)
+            ) + guided
+            per_field_logp_uncond[name] = per_field_logp_uncond.get(
                 name, torch.zeros_like(unconditional)
             ) + unconditional
 
@@ -419,6 +455,7 @@ class GuidedPredictorCorrector(PredictorCorrector):
                             logp_uncond = logp_uncond + lp_u
                             component_name = f"{field_name}:corrector"
                             _record_lattice_component(component_name, lp_g, lp_u)
+                            _record_per_field(component_name, lp_g, lp_u)
                             included_fields.append(component_name)
                             continue
                         if field_name not in batch_indices:
@@ -444,12 +481,11 @@ class GuidedPredictorCorrector(PredictorCorrector):
                         lp_g_rows = _gaussian_logp_per_row(sample, mean_g, std, boundary=_boundary)
                         lp_u_rows = _gaussian_logp_per_row(sample, mean_u, std, boundary=_boundary)
                         bidx = batch_indices[field_name]
-                        logp_guided = logp_guided + scatter_add(
-                            lp_g_rows, index=bidx, dim=0, dim_size=B
-                        )
-                        logp_uncond = logp_uncond + scatter_add(
-                            lp_u_rows, index=bidx, dim=0, dim_size=B
-                        )
+                        lp_g_samples = scatter_add(lp_g_rows, index=bidx, dim=0, dim_size=B)
+                        lp_u_samples = scatter_add(lp_u_rows, index=bidx, dim=0, dim_size=B)
+                        logp_guided = logp_guided + lp_g_samples
+                        logp_uncond = logp_uncond + lp_u_samples
+                        _record_per_field(f"{field_name}:corrector", lp_g_samples, lp_u_samples)
                         included_fields.append(f"{field_name}:corrector")
 
         # ---- Predictor update (included in logp) ----
@@ -548,6 +584,7 @@ class GuidedPredictorCorrector(PredictorCorrector):
                     if not shared_final_predictor:
                         logp_guided = logp_guided + lp_g
                         logp_uncond = logp_uncond + lp_u
+                        _record_per_field(field_name, lp_g, lp_u)
                     _record_lattice_component(field_name, lp_g, lp_u)
                     included_fields.append(field_name)
                     continue
@@ -581,12 +618,11 @@ class GuidedPredictorCorrector(PredictorCorrector):
                 # Aggregate row-level logp to per-sample logp via batch_idx.
                 bidx = batch_indices[field_name]
                 if not shared_final_predictor:
-                    logp_guided = logp_guided + scatter_add(
-                        lp_g_rows, index=bidx, dim=0, dim_size=B
-                    )
-                    logp_uncond = logp_uncond + scatter_add(
-                        lp_u_rows, index=bidx, dim=0, dim_size=B
-                    )
+                    lp_g_samples = scatter_add(lp_g_rows, index=bidx, dim=0, dim_size=B)
+                    lp_u_samples = scatter_add(lp_u_rows, index=bidx, dim=0, dim_size=B)
+                    logp_guided = logp_guided + lp_g_samples
+                    logp_uncond = logp_uncond + lp_u_samples
+                    _record_per_field(field_name, lp_g_samples, lp_u_samples)
                 included_fields.append(field_name)
             elif isinstance(predictor, D3PMAncestralSamplingPredictor):
                 if field_name not in batch_indices:
@@ -645,17 +681,21 @@ class GuidedPredictorCorrector(PredictorCorrector):
                 )
 
                 if not shared_final_predictor:
-                    logp_guided = logp_guided + scatter_add(
-                        lp_g_rows, index=bidx, dim=0, dim_size=B
-                    )
-                    logp_uncond = logp_uncond + scatter_add(
-                        lp_u_rows, index=bidx, dim=0, dim_size=B
-                    )
+                    lp_g_samples = scatter_add(lp_g_rows, index=bidx, dim=0, dim_size=B)
+                    lp_u_samples = scatter_add(lp_u_rows, index=bidx, dim=0, dim_size=B)
+                    logp_guided = logp_guided + lp_g_samples
+                    logp_uncond = logp_uncond + lp_u_samples
+                    _record_per_field(field_name, lp_g_samples, lp_u_samples)
                 included_fields.append(field_name)
             else:
                 continue
         if not include_lattice_logp and timestep_i >= 999:
             logp_uncond = logp_guided
+            # The terminal-step compat shim overrides the totals, so the
+            # per-field breakdown no longer sums to them. Drop it rather than
+            # return components that disagree with logp_uncond.
+            per_field_logp_guided.clear()
+            per_field_logp_uncond.clear()
         info: dict[str, torch.Tensor] = {
             "logp_guided": logp_guided,
             "logp_uncond": logp_uncond,
@@ -665,6 +705,8 @@ class GuidedPredictorCorrector(PredictorCorrector):
         }
         # Keep a couple of "meta" items as python-only keys for debugging.
         info["_logp_field_names"] = included_fields  # type: ignore[index]
+        info["_per_field_logp_guided"] = per_field_logp_guided  # type: ignore[index]
+        info["_per_field_logp_uncond"] = per_field_logp_uncond  # type: ignore[index]
         info["_lattice_logp_guided"] = lattice_logp_guided  # type: ignore[index]
         info["_lattice_logp_uncond"] = lattice_logp_uncond  # type: ignore[index]
         info["_shared_final_predictor"] = torch.tensor(
