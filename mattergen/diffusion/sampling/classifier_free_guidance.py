@@ -349,6 +349,22 @@ class GuidedPredictorCorrector(PredictorCorrector):
                 name, torch.zeros_like(unconditional)
             ) + unconditional
 
+        # Kernel diagnostics for the closure test. For a Langevin corrector both
+        # kernels are N(x + eps*s, 2*eps) with a shared eps, so
+        #     log eta = -(eps/4)*||d||^2 - sqrt(eps/2) * z.d,   d = s_g - s_u,
+        # and the whole log-ratio distribution is determined by the two scalars
+        # recorded here. Stored separately, not as their product: eps carries no
+        # num_atoms term while ||d||^2 does, and only the split shows that.
+        per_field_diag: dict[str, torch.Tensor] = {}
+
+        def _record_diag(name: str, value: torch.Tensor) -> None:
+            """Accumulate a per-sample [B] diagnostic under ``name``."""
+            if not record_per_field:
+                return
+            per_field_diag[name] = per_field_diag.get(
+                name, torch.zeros_like(value)
+            ) + value
+
         # ---- Corrector updates (optional; NOT included in logp if predictor_logp_only) ----
         if self._correctors:
             if predictor_logp_only and self._n_steps_corrector > 0:
@@ -466,10 +482,10 @@ class GuidedPredictorCorrector(PredictorCorrector):
                             continue
 
                         if isinstance(corrector, LatticeLangevinDiffCorrector):
-                            step_size = lattice_empirical_step_size(t)
+                            step_size_per_sample = lattice_empirical_step_size(t)
                         else:
-                            step_size = base_empirical_step_size(t)
-                        step_size = maybe_expand(step_size, batch_indices[field_name], guided_score[field_name])
+                            step_size_per_sample = base_empirical_step_size(t)
+                        step_size = maybe_expand(step_size_per_sample, batch_indices[field_name], guided_score[field_name])
                         std = torch.sqrt(torch.clamp(step_size * 2, min=eps))
 
                         mean_g = x_pre_corrector[field_name] + step_size * guided_score[field_name]
@@ -487,6 +503,22 @@ class GuidedPredictorCorrector(PredictorCorrector):
                         logp_uncond = logp_uncond + lp_u_samples
                         _record_per_field(f"{field_name}:corrector", lp_g_samples, lp_u_samples)
                         included_fields.append(f"{field_name}:corrector")
+
+                        if record_per_field:
+                            # ||d||^2 per structure: square-sum the 3 spatial
+                            # components per row, then scatter, so this is a
+                            # per-structure sum and not a per-atom mean.
+                            d_rows = guided_score[field_name] - uncond_score[field_name]
+                            d2_rows = (d_rows**2).flatten(start_dim=1).sum(dim=-1)
+                            _record_diag(
+                                f"{field_name}:corrector:d2",
+                                scatter_add(d2_rows, index=bidx, dim=0, dim_size=B),
+                            )
+                            # eps is already per-sample [B] before maybe_expand.
+                            _record_diag(
+                                f"{field_name}:corrector:eps",
+                                step_size_per_sample.reshape(-1).expand(B).clone(),
+                            )
 
         # ---- Predictor update (included in logp) ----
         uncond_score, cond_score = self._score_pair(x=batch, t=t)
@@ -696,6 +728,10 @@ class GuidedPredictorCorrector(PredictorCorrector):
             # return components that disagree with logp_uncond.
             per_field_logp_guided.clear()
             per_field_logp_uncond.clear()
+            # Same reason: the forced log_eta of zero cannot be reconciled with a
+            # nonzero ||d||^2, so drop the diagnostics rather than hand back a
+            # pair that fails the closure identity by construction.
+            per_field_diag.clear()
         info: dict[str, torch.Tensor] = {
             "logp_guided": logp_guided,
             "logp_uncond": logp_uncond,
@@ -707,6 +743,7 @@ class GuidedPredictorCorrector(PredictorCorrector):
         info["_logp_field_names"] = included_fields  # type: ignore[index]
         info["_per_field_logp_guided"] = per_field_logp_guided  # type: ignore[index]
         info["_per_field_logp_uncond"] = per_field_logp_uncond  # type: ignore[index]
+        info["_per_field_diag"] = per_field_diag  # type: ignore[index]
         info["_lattice_logp_guided"] = lattice_logp_guided  # type: ignore[index]
         info["_lattice_logp_uncond"] = lattice_logp_uncond  # type: ignore[index]
         info["_shared_final_predictor"] = torch.tensor(
