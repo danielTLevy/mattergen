@@ -152,8 +152,13 @@ def load_structures(input_path: Path) -> Sequence[Structure]:
 
 
 def extract_structures_from_folder(dirname: str) -> Sequence[Structure]:
+    # Deterministic (lexicographic) enumeration: downstream artifacts such as
+    # structure_sun_info.json / sun_index_mapping.json are keyed by position
+    # in this list, and analyses join them against per-structure metadata.
+    # Bare os.listdir() order is filesystem-dependent (ext4 hash order), which
+    # silently scrambles any such index join.
     structures = []
-    for filename in os.listdir(dirname):
+    for filename in sorted(os.listdir(dirname)):
         if filename.endswith(".cif"):
             try:
                 structures.append(Structure.from_file(f"{dirname}/{filename}"))

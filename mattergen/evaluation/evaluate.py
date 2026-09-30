@@ -55,9 +55,12 @@ def evaluate(
         )
     else:
         relaxed_structures = structures
-        energies = get_total_energies(
-            structures, device=device, potential_load_path=potential_load_path
-        )
+        if energies is None:
+            energies = get_total_energies(
+                structures, device=device, potential_load_path=potential_load_path
+            )
+        # else: caller-supplied energies (e.g., DFT or an external MLIP) are
+        # used as-is; previously they were silently overwritten by MatterSim.
 
     evaluator = MetricsEvaluator.from_structures_and_energies(
         structures=relaxed_structures,
